@@ -1,12 +1,14 @@
 {
-  "max_domains": 10,
-	"max_ext_length": 10,
-	"style": "gitstats.css",
-	"max_authors": 20,
-	"authors_top": 5,
-	"commit_begin": "",
-	"commit_end": "HEAD",
-	"linear_linestats": 1,
-	"processes": 8,
-	"start_date": ""
+	"processes" : 8,
+	"log_show" : 1,
+
+	"branch_list" : [],
+	"commit_begin" : "",
+	"commit_end" : "HEAD",
+	"start_date" : "",
+	"end_date" : "",
+
+	"commit_max_lines" : 500,
+	"file_max_commit_lines" : 100,
+	"file_re_exclude": [".pb.h$", ".pb.cc$", "^3rd/", "^build/", "^output_"]
 }

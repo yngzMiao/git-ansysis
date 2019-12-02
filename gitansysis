@@ -7,15 +7,13 @@ import os, sys
 import shutil
 import subprocess
 import json
+import re, ast
 from multiprocessing import Pool
 
 ON_LINUX = (platform.system() == "Linux")
 
 def getpipeoutput(cmds, quiet = False):
 	start = time.time()
-	if not quiet and ON_LINUX and os.isatty(1):
-		print(">> " + " | ".join(cmds))
-		sys.stdout.flush()
 	p = subprocess.Popen(cmds[0], stdout = subprocess.PIPE, shell = True)
 	processes = [p]
 	for x in cmds[1:]:
@@ -26,8 +24,6 @@ def getpipeoutput(cmds, quiet = False):
 		p.wait()
 	end = time.time()
 	if not quiet:
-		if ON_LINUX and os.isatty(1):
-			print("\r")
 		print("[%.5f] >> %s" % (end - start, " | ".join(cmds)))
 	return output.rstrip("\n")
 
@@ -44,17 +40,239 @@ def getcommitrange(conf, defaultrange = "HEAD", end_only = False):
 		return "%s..%s" % (conf["commit_begin"], conf["commit_end"])
 	return defaultrange
 
+def getnumoffilesfromrev(argList):
+	conf, (stamp, rev, auth) = argList
+	# line format: <file_name>
+	files = getpipeoutput(['git ls-tree -r --name-only "%s"' % rev]).split("\n")
+	files_new = []
+	for fi in files:
+		fi = fi.strip().split('\n')[0]
+		flag = True
+		for co in ast.literal_eval(str(conf["file_re_exclude"])):
+			if not re.match(str(co), fi) == None:
+				flag = False
+				break
+		if flag == True:
+			files_new.append(fi)
+	return (int(stamp), rev, auth, files_new)
+
 class GitDataCollector:
 	def __init__(self, conf, gitpath):
 		self.conf = conf
 		self.gitpath = gitpath
+		# format: { author: { "first_commit_stamp": stamp, "last_commit_stamp": stamp, "last_active_day": day, "active_days": [day]} }
 		self.authors = {}
+		# format: { author: [hashcode] }
+		self.author_commit = {}
 		self.total_authors = 0
+		self.total_commits = 0
+		# format: {"date": date, "hashcode": hashcode, "commits": commits, "stamp": stamp, "authors": { "author": commits}}
+		self.tags = {}
+
+		# format: { year_month: { author: commits} }
+		self.author_of_month = {}
+		# format: { year: { author: commits} }
+		self.author_of_year = {}
+		# format: { year_month: commits }
+		self.commits_by_month = {}
+		# format: { year: commits }
+		self.commits_by_year = {}
+
+		self.last_active_day = None
+		self.active_days = set()
+
+		# format: { timezone: commits }
+		self.commits_by_timezone = {}
+
+		self.first_commit_stamp = 0
+		self.last_commit_stamp = 0
+
+		# format: { hour: commits }
+		self.activity_by_hour_of_day = {}
+		# format: { day: commits }
+		self.activity_by_day_of_week = {}
+		# format: { day: { hour: commits} }
+		self.activity_by_hour_of_week = {}
+		# format: { mouth: commits }
+		self.activity_by_month_of_year = {}
+		# format: { year_week: commits }
+		self.activity_by_year_week = {}
+
+		# format: { domain: {"commits": commits} }
+		self.domains = {}
+
+		# format: { "files_in_tree": { hashcode: [file] } }
+		self.cache = {}
+
+		# format: { stamp: files_num }
+		self.files_by_stamp = {}
 
 	def collect(self):
 		os.chdir(self.gitpath)
-		self.total_authors = int(getpipeoutput(['git shortlog -s %s' % getlogrange(self.conf), 'wc -l']))
-		print(self.total_authors)
+		# total_authors
+		# line format: "<authors_num>"
+		self.total_authors = int(getpipeoutput(["git shortlog -s %s" % getlogrange(self.conf), "wc -l"]))
+
+		# tags
+		# line format: "<hashcode> <refs/tags/tag>"
+		lines = getpipeoutput(["git show-ref --tags"]).strip().split("\n")
+		for line in lines:
+			if len(line) == 0:
+				continue
+			hashcode, tag = line.split(" ")
+			tag = tag.replace("refs/tags/", "")
+			# line format: "<stamp> <author>"
+			output = getpipeoutput(["git log '%s' --pretty=format:'%%at %%aN' -n 1" % hashcode])
+			if len(output) > 0 and len(output.split(" ")) == 2:
+				stamp = int(output.split(" ")[0])
+				self.tags[tag] = { "stamp": stamp, "hashcode" : hashcode, "date" : datetime.datetime.fromtimestamp(stamp).strftime('%Y-%m-%d'), "commits": 0, "authors": {} }
+		
+		# collect info between two tags, starting from latest
+		tags_sorted_by_date_desc = list(map(lambda el : el[1], reversed(sorted(list(map(lambda el : (el[1]["date"], el[0]), self.tags.items()))))))
+		prev = None
+		for tag in reversed(tags_sorted_by_date_desc):
+			cmd = "git shortlog -s '%s'" % tag
+			if prev != None:
+				cmd += " '^%s'" % prev
+			output = getpipeoutput([cmd])
+			if len(output) == 0:
+				continue
+			prev = tag
+			for line in output.split("\n"):
+				# line format: "<commit_num> <author>"
+				parts = re.split("\s+", line, 2)
+				commits = int(parts[1])
+				author = parts[2]
+				self.tags[tag]["commits"] += commits
+				self.tags[tag]["authors"][author] = commits
+		
+		# Collect revision statistics
+		# line format: "<stamp> <date> <time> <timezone> <author> '<' <mail> '>'"
+		lines = getpipeoutput(["git rev-list --pretty=format:'%%at %%ai %%aN <%%aE>' %s" % getlogrange(self.conf, "HEAD"), "grep -v ^commit"]).split("\n")
+		for line in lines:
+			parts = line.split(" ", 4)
+			stamp = int(parts[0])
+			timezone = parts[3]
+			author, mail = parts[4].split("<", 1)
+			author = author.rstrip()
+			mail = mail.rstrip(">")
+			domain = "?"
+			if mail.find("@") != -1:
+				domain = mail.rsplit("@", 1)[1]
+			date = datetime.datetime.fromtimestamp(stamp)
+
+			# First and last commit stamp
+			if stamp > self.last_commit_stamp:
+				self.last_commit_stamp = stamp
+			if self.first_commit_stamp == 0 or stamp < self.first_commit_stamp:
+				self.first_commit_stamp = stamp
+
+			# activity by datetime
+			# hour
+			hour = date.hour
+			self.activity_by_hour_of_day[hour] = self.activity_by_hour_of_day.get(hour, 0) + 1
+			# day of week
+			day = date.weekday()
+			self.activity_by_day_of_week[day] = self.activity_by_day_of_week.get(day, 0) + 1
+			# domain stats
+			if domain not in self.domains:
+				self.domains[domain] = {}
+			self.domains[domain]["commits"] = self.domains[domain].get("commits", 0) + 1
+			# hour of week
+			if day not in self.activity_by_hour_of_week:
+				self.activity_by_hour_of_week[day] = {}
+			self.activity_by_hour_of_week[day][hour] = self.activity_by_hour_of_week[day].get(hour, 0) + 1
+			# month of year
+			month = date.month
+			self.activity_by_month_of_year[month] = self.activity_by_month_of_year.get(month, 0) + 1
+			# year_week activity
+			yyw = date.strftime("%Y-%W")
+			self.activity_by_year_week[yyw] = self.activity_by_year_week.get(yyw, 0) + 1
+
+			# author stats
+			if author not in self.authors:
+				self.authors[author] = {}
+			# author first or last commits
+			if "last_commit_stamp" not in self.authors[author]:
+				self.authors[author]["last_commit_stamp"] = stamp
+			if stamp > self.authors[author]["last_commit_stamp"]:
+				self.authors[author]["last_commit_stamp"] = stamp
+			if "first_commit_stamp" not in self.authors[author]:
+				self.authors[author]["first_commit_stamp"] = stamp
+			if stamp < self.authors[author]["first_commit_stamp"]:
+				self.authors[author]["first_commit_stamp"] = stamp
+			
+			# author year_month commits
+			yymm = date.strftime('%Y-%m')
+			if yymm in self.author_of_month:
+				self.author_of_month[yymm][author] = self.author_of_month[yymm].get(author, 0) + 1
+			else:
+				self.author_of_month[yymm] = {}
+				self.author_of_month[yymm][author] = 1
+			self.commits_by_month[yymm] = self.commits_by_month.get(yymm, 0) + 1
+			# author year commits
+			yy = date.year
+			if yy in self.author_of_year:
+				self.author_of_year[yy][author] = self.author_of_year[yy].get(author, 0) + 1
+			else:
+				self.author_of_year[yy] = {}
+				self.author_of_year[yy][author] = 1
+			self.commits_by_year[yy] = self.commits_by_year.get(yy, 0) + 1
+
+			# authors active days
+			yymmdd = date.strftime("%Y-%m-%d")
+			if "last_active_day" not in self.authors[author]:
+				self.authors[author]["last_active_day"] = yymmdd
+				self.authors[author]["active_days"] = set([yymmdd])
+			elif yymmdd != self.authors[author]["last_active_day"]:
+				self.authors[author]["last_active_day"] = yymmdd
+				self.authors[author]["active_days"].add(yymmdd)
+
+			# project active days
+			if yymmdd != self.last_active_day:
+				self.last_active_day = yymmdd
+				self.active_days.add(yymmdd)
+
+			# timezone
+			self.commits_by_timezone[timezone] = self.commits_by_timezone.get(timezone, 0) + 1
+
+		# Collect file statistics
+		# line format: "<stamp> <hashcode> <author>"
+		revlines = getpipeoutput(["git rev-list --pretty=format:'%%at %%T %%aN' %s" % getlogrange(self.conf, "HEAD"), "grep -v ^commit"]).strip().split('\n')
+		lines = []
+		revs_to_read = []
+		author_to_read = []
+		for revline in revlines:
+			print(revline)
+			parts = revline.split(" ", 3)
+			tamp = parts[0]
+			rev = parts[1]
+			author = parts[2]
+			revs_to_read.append((tamp, rev, author))
+		
+		# get every revision files
+		pool = Pool(processes = self.conf["processes"])
+		argList = [(self.conf, tamp_rev_auth) for tamp_rev_auth in revs_to_read]
+		stamp_rev_auth_files = pool.map(getnumoffilesfromrev, argList)
+		pool.terminate()
+		pool.join()
+
+		# Update cache with new revisions and append then to general list
+		for (tamp, rev, author, files) in stamp_rev_auth_files:
+			if "files_in_tree" not in self.cache:
+				self.cache["files_in_tree"] = {}
+			self.cache["files_in_tree"][rev] = files
+			if author not in self.author_commit:
+				self.author_commit[author] = []
+			self.author_commit[author].append(rev)
+			lines.append("%d %d" % (int(tamp), len(files)))
+		self.total_commits = len(lines)
+		for line in lines:
+			parts = line.split(" ")
+			if len(parts) != 2:
+				continue
+			(stamp, file_num) = parts[0:2]
+			self.files_by_stamp[int(stamp)] = int(file_num)
 
 def usage(conf):
 	print("""
@@ -87,6 +305,12 @@ def checkparams():
 	for o, v in optlist:
 		if o == '-c':
 			key, value = v.split('=', 1)
+			if key.startswith("\"") and key.endswith("\""):
+				key = key[1:-2]
+			if value.startswith("\"") and value.endswith("\""):
+				value = value[1:-2]
+			if value.startswith("[") and value.endswith("]"):
+				value = ast.literal_eval(value)
 			if key not in conf:
 				print("\nError: no such key %s in config keys" % key)
 				usage(conf)
